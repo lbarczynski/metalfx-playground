@@ -1,0 +1,39 @@
+name: macOS C++20 & Metal CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  lint-and-format:
+    name: Code Formatting & Static Analysis
+    runs-on: macos-14
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Verify Code Formatting (clang-format)
+        run: |
+          find src tests \( -name '*.cpp' -o -name '*.hpp' \) | xargs clang-format --dry-run --Werror
+
+  build-and-test:
+    name: Build & CTest (Apple Silicon)
+    runs-on: macos-14
+    needs: lint-and-format
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Ninja
+        run: brew install ninja
+
+      - name: Configure CMake Presets
+        run: cmake --preset macos-ci
+
+      - name: Build Targets
+        run: cmake --build --preset macos-ci-build
+
+      - name: Run Test Suite (CTest)
+        run: ctest --preset macos-ci-test --output-on-failure

@@ -1,0 +1,27 @@
+# GitLab CI/CD Pipeline for MetalFX & Modern C++ Playground
+# Requires a macOS Apple Silicon runner tagged with 'macos' or 'macos-14'
+
+stages:
+  - lint
+  - build
+  - test
+
+variables:
+  GIT_SUBMODULE_STRATEGY: recursive
+
+format-check:
+  stage: lint
+  tags:
+    - macos
+  script:
+    - echo "Checking formatting with clang-format..."
+    - find src tests \( -name '*.cpp' -o -name '*.hpp' \) | xargs clang-format --dry-run --Werror
+
+build-and-test:
+  stage: build
+  tags:
+    - macos
+  script:
+    - cmake --preset macos-ci
+    - cmake --build --preset macos-ci-build
+    - ctest --preset macos-ci-test --output-on-failure

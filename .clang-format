@@ -1,0 +1,62 @@
+---
+# .clang-format: C++20 Formatting Configuration for MetalFX Playground
+BasedOnStyle: LLVM
+Language: Cpp
+Standard: c++20
+
+# Indentation & Alignment
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 100
+AccessModifierOffset: -4
+
+# Braces & Formatting
+BreakBeforeBraces: Attach
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortBlocksOnASingleLine: Never
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+
+# Pointers & References
+PointerAlignment: Left
+ReferenceAlignment: Left
+
+# Namespaces & Classes
+FixNamespaceComments: true
+CompactNamespaces: false
+NamespaceIndentation: None
+
+# Includes Sorting
+SortIncludes: CaseSensitive
+IncludeBlocks: Regroup
+IncludeCategories:
+  - Regex: '^<Foundation/'
+    Priority: 1
+  - Regex: '^<Metal/'
+    Priority: 2
+  - Regex: '^<MetalKit/'
+    Priority: 3
+  - Regex: '^<MetalFX/'
+    Priority: 4
+  - Regex: '^<QuartzCore/'
+    Priority: 5
+  - Regex: '^<AppKit/'
+    Priority: 6
+  - Regex: '^<simd/'
+    Priority: 7
+  - Regex: '^<catch2/'
+    Priority: 8
+  - Regex: '^<[a-z0-9_]+>'
+    Priority: 9
+  - Regex: '.*'
+    Priority: 10
+
+# Templates & Modern C++
+SpacesInAngles: false
+SpaceAfterTemplateKeyword: true
+SpaceBeforeRangeBasedForLoopColon: true
+SpaceInEmptyBlock: false
+KeepEmptyLinesAtTheStartOfBlocks: false
+MaxEmptyLinesToKeep: 1
+...

@@ -1,0 +1,99 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 25,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_CXX_STANDARD": "20",
+        "CMAKE_CXX_STANDARD_REQUIRED": "ON"
+      }
+    },
+    {
+      "name": "macos-debug",
+      "inherits": "base",
+      "displayName": "macOS Debug (ASan + UBSan)",
+      "description": "Debug build with AddressSanitizer and UndefinedBehaviorSanitizer enabled",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "ENABLE_SANITIZERS": "ON",
+        "BUILD_TESTING": "ON"
+      }
+    },
+    {
+      "name": "macos-release",
+      "inherits": "base",
+      "displayName": "macOS Release",
+      "description": "Optimized release build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "ENABLE_SANITIZERS": "OFF",
+        "BUILD_TESTING": "OFF"
+      }
+    },
+    {
+      "name": "macos-ci",
+      "inherits": "base",
+      "displayName": "macOS CI / Headless",
+      "description": "Continuous Integration build with testing and diagnostics",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "ENABLE_SANITIZERS": "OFF",
+        "BUILD_TESTING": "ON"
+      }
+    },
+    {
+      "name": "macos-xcode",
+      "displayName": "macOS Xcode Project",
+      "description": "Generates native Xcode project for Metal frame debugging",
+      "generator": "Xcode",
+      "binaryDir": "${sourceDir}/build/xcode",
+      "cacheVariables": {
+        "BUILD_TESTING": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "macos-debug-build",
+      "configurePreset": "macos-debug",
+      "displayName": "Build Debug"
+    },
+    {
+      "name": "macos-release-build",
+      "configurePreset": "macos-release",
+      "displayName": "Build Release"
+    },
+    {
+      "name": "macos-ci-build",
+      "configurePreset": "macos-ci",
+      "displayName": "Build CI"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "macos-debug-test",
+      "configurePreset": "macos-debug",
+      "displayName": "Run Debug Tests",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "macos-ci-test",
+      "configurePreset": "macos-ci",
+      "displayName": "Run CI Tests",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

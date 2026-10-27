@@ -1,0 +1,40 @@
+# Build outputs
+build/
+bin/
+lib/
+out/
+*.o
+*.a
+*.dylib
+
+# CMake temporary files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakePresets.json
+!CMakeUserPresets.json
+!tests/CMakeLists.txt
+!src/CMakeLists.txt
+!CMakeLists.txt
+
+# Package managers
+vcpkg_installed/
+.vcpkg/
+
+# IDE files
+.idea/
+.vscode/
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+DerivedData/
+
+# OS files
+.DS_Store
+*.gputrace
+
+# Teamwork orchestration
+.agents/teamwork/
+
