@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(MetalFXPlayground LANGUAGES CXX)
+project(MetalFXPlayground LANGUAGES CXX OBJCXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -63,13 +63,15 @@ target_link_libraries(metal_cpp_interface INTERFACE
 )
 
 # -----------------------------------------------------------------------------
-# Single Translation Unit for metal-cpp Implementation Symbols
+# Translation Unit for metal-cpp Implementation Symbols
 # -----------------------------------------------------------------------------
-add_library(metal_impl STATIC
-    src/metal_impl.cpp
-)
-target_link_libraries(metal_impl PUBLIC metal_cpp_interface)
-target_compile_options(metal_impl PRIVATE -Wno-conversion -Wno-pedantic)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/metal_impl.cpp")
+    add_library(metal_impl STATIC
+        src/metal_impl.cpp
+    )
+    target_link_libraries(metal_impl PUBLIC metal_cpp_interface)
+    target_compile_options(metal_impl PRIVATE -Wno-conversion -Wno-pedantic)
+endif()
 
 # -----------------------------------------------------------------------------
 # Subdirectories: Application & Testing

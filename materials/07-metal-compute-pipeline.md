@@ -1,35 +1,41 @@
-# TASK-07: Metal Compute Pipeline (CUDA vs Metal Mental Model)
+# TASK-07: Metal Compute Pipeline & CPU Readback
 
 ## 1. Concept & Mental Model
-Metal compute provides direct General-Purpose GPU (GPGPU) computing for massively parallel data processing (e.g. physics simulations, particle advection, procedural synthesis) decoupled from the rasterizer. CUDA developers map CUDA grids, blocks, and warps directly to Metal grids, threadgroups, and SIMD-groups; however, Metal executes compute kernels via an explicit command encoder (`MTL::ComputeCommandEncoder`) without custom compiler syntax (`<<<grid, block>>>`).
+
+### The Kotlin / Android Bridge
+In Android, computationally heavy algorithms (like particle physics or image filters) are either run on CPU worker threads (Coroutines / `Dispatchers.Default`), executed via RenderScript (now deprecated), or dispatched via Vulkan compute shaders or OpenCL.
+
+In Modern C++ and Metal:
+- **Massively Parallel GPGPU Compute**: Metal compute pipelines allow you to use the GPU's thousands of execution cores for non-graphics data processing.
+- **Unified Address Space**: Because Apple Silicon has Unified Memory, the CPU can read the GPU's computed output directly from `MTL::Buffer::contents()` with zero PCIe transfer overhead once execution completes.
+- **Explicit Command Encoding**: Unlike CUDA's custom language syntax (`kernel<<<grid, block>>>`), Metal encodes compute passes into standard `MTL::CommandBuffer` instances using `MTL::ComputeCommandEncoder`.
+
+---
 
 ## 2. Mathematical Foundations & Algorithms
-### Thread Hierarchy Mapping (CUDA vs Metal)
-| CUDA Concept | Metal Equivalent | Apple Silicon Value / Behavior |
+
+### Thread Hierarchy Mapping
+| Concept | Metal Equivalent | Apple Silicon Behavior |
 | :--- | :--- | :--- |
-| **Thread** | **Thread** | Single SIMD lane execution |
+| **Individual Thread** | **Thread** | Single SIMD lane execution |
 | **Warp (32 threads)** | **SIMD-group** | Strictly **32 lanes** on Apple Silicon |
-| **Block / Thread Block** | **Threadgroup** | Up to 1024 threads; shared local memory |
-| **Shared Memory (`__shared__`)** | **`threadgroup` memory** | 32 KB high-bandwidth on-chip SRAM |
+| **Thread Block** | **Threadgroup** | Up to 1024 threads; shared on-chip SRAM |
 | **Grid** | **Grid** | 1D, 2D, or 3D execution extent |
 
-### Dispatch Dimension Formula
-For $N$ linear elements and a 1D threadgroup size $T_x$ (typically 256):
-$$\text{Threadgroups}_x = \left\lceil \frac{N}{T_x} \right\rceil = \frac{N + T_x - 1}{T_x}$$
-
-In modern Metal (macOS 10.15+ / Metal 2+), `dispatchThreads` allows non-uniform grids without boundary padding:
-$$\text{GridSize} = \text{MTL::Size::Make}(N, 1, 1), \quad \text{ThreadgroupSize} = \text{MTL::Size::Make}(T_x, 1, 1)$$
-
-### Particle Euler Advection Algorithm
+### Particle Euler Advection
+For $N$ particles updated across time step $\Delta t$:
 $$\mathbf{p}_i^{t + \Delta t} = \mathbf{p}_i^t + \mathbf{v}_i^t \Delta t$$
 $$\text{Boundary Reflection}: \text{if } |p_{i,x}| > 1.0 \implies v_{i,x} = -v_{i,x}$$
 
+---
+
 ## 3. Metal & C++ Blueprint
 
-### 1. Shared Data Struct Layout (`SharedTypes.h`)
+### 1. Shared Types Header (`src/ComputeTypes.hpp`)
 ```cpp
 #pragma once
 #include <simd/simd.h>
+#include <cstdint>
 
 struct Particle {
     simd::float2 position;
@@ -57,15 +63,17 @@ struct ComputeParams {
     uint particleCount;
 };
 
-kernel void updateParticles(device Particle* particles [[buffer(0)]],
-                            constant ComputeParams& params [[buffer(1)]],
-                            uint id [[thread_position_in_grid]]) {
+kernel void updateParticles(
+    device Particle* particles [[buffer(0)]],
+    constant ComputeParams& params [[buffer(1)]],
+    uint id [[thread_position_in_grid]]
+) {
     if (id >= params.particleCount) return;
 
     Particle p = particles[id];
     p.position += p.velocity * params.dt;
 
-    // Boundary reflection
+    // Bounce off NDC boundaries
     if (abs(p.position.x) > 1.0f) { p.velocity.x *= -1.0f; }
     if (abs(p.position.y) > 1.0f) { p.velocity.y *= -1.0f; }
 
@@ -73,27 +81,24 @@ kernel void updateParticles(device Particle* particles [[buffer(0)]],
 }
 ```
 
-### 3. Compute Pipeline & Dispatch Execution (C++)
+### 3. Compute Pipeline & Execution in C++
 ```cpp
-#include <Metal/Metal.hpp>
-#include <iostream>
-
-// 1. Pipeline Creation
-NS::Error* pError = nullptr;
+// 1. Create compute pipeline state
 MTL::Function* pKernelFunc = pLibrary->newFunction(
     NS::String::string("updateParticles", NS::UTF8StringEncoding)
 );
 MTL::ComputePipelineState* pComputePipeline = pDevice->newComputePipelineState(pKernelFunc, &pError);
 pKernelFunc->release();
 
-// 2. Buffer Allocation
-constexpr uint32_t kNumParticles = 100000;
+// 2. Allocate and initialize particles buffer
+constexpr uint32_t kNumParticles = 10000;
 MTL::Buffer* pParticleBuffer = pDevice->newBuffer(
     sizeof(Particle) * kNumParticles,
     MTL::ResourceStorageModeShared
 );
+// [Initialize particle positions and velocities...]
 
-// 3. Command Encoding
+// 3. Encode compute dispatch
 MTL::CommandBuffer* cmd = pQueue->commandBuffer();
 MTL::ComputeCommandEncoder* compEnc = cmd->computeCommandEncoder();
 
@@ -101,46 +106,53 @@ compEnc->setComputePipelineState(pComputePipeline);
 compEnc->setBuffer(pParticleBuffer, 0, 0);
 
 ComputeParams params = { .dt = 0.016f, .particleCount = kNumParticles };
-// setBytes is optimized for small uniform data (<= 4 KB)
 compEnc->setBytes(&params, sizeof(ComputeParams), 1);
 
-// Threadgroup calculation
-NS::UInteger maxThreads = pComputePipeline->maxTotalThreadsPerThreadgroup();
-NS::UInteger threadgroupSize = std::min(static_cast<NS::UInteger>(256), maxThreads);
-
+// Threadgroup sizing
+NS::UInteger threadgroupSize = std::min(
+    static_cast<NS::UInteger>(256),
+    pComputePipeline->maxTotalThreadsPerThreadgroup()
+);
 MTL::Size gridSize = MTL::Size::Make(kNumParticles, 1, 1);
 MTL::Size tgSize = MTL::Size::Make(threadgroupSize, 1, 1);
 
-// Modern non-uniform grid dispatch
 compEnc->dispatchThreads(gridSize, tgSize);
 compEnc->endEncoding();
 
-// Synchronize and verify CPU readback
 cmd->commit();
 cmd->waitUntilCompleted();
 
+// Readback results directly on CPU
 Particle* results = static_cast<Particle*>(pParticleBuffer->contents());
-std::cout << "First Particle Pos: (" << results[0].position.x << ", " << results[0].position.y << ")\n";
+std::cout << "Particle 0 updated position: (" << results[0].position.x << ", " << results[0].position.y << ")\n";
 ```
 
-## 4. Step-by-Step Implementation Checklist
-- [ ] Define `Particle` and `ComputeParams` struct in a shared header.
-- [ ] Write the MSL compute kernel using `kernel void ... [[thread_position_in_grid]]`.
-- [ ] Compile kernel function into `MTL::ComputePipelineState`.
-- [ ] Allocate unified memory buffer (`MTL::ResourceStorageModeShared`) populated with initial particle positions.
-- [ ] Create `MTL::ComputeCommandEncoder` via `cmd->computeCommandEncoder()`.
-- [ ] Query `pipelineState->maxTotalThreadsPerThreadgroup()` to ensure threadgroup sizing fits within hardware limits.
-- [ ] Dispatch threads using `compEnc->dispatchThreads(gridSize, threadgroupSize)`.
-- [ ] End encoding, commit command buffer, and call `cmd->waitUntilCompleted()`.
-- [ ] Inspect buffer contents on CPU to verify numerical updates.
+---
 
-## 5. Common Pitfalls & Debugging Checklist
+## 4. Step-by-Step Implementation Checklist
+- [ ] Define `Particle` and `ComputeParams` struct in `src/ComputeTypes.hpp`.
+- [ ] Write `updateParticles` kernel in MSL.
+- [ ] Create `MTL::ComputePipelineState` from the kernel function.
+- [ ] Allocate and populate `MTL::Buffer` with $10\,000$ particles in shared memory.
+- [ ] Encode compute command with `dispatchThreads` using 256 threads per threadgroup.
+- [ ] Commit command buffer, wait for GPU completion, and assert that particle positions changed on the CPU.
+
+---
+
+## 5. Definition of Done & Commit Message
+- **DoD**: Compute pipeline executes on GPU, updates particle positions, and CPU asserts valid mathematical advection upon buffer readback.
+- **Commit**:
+  ```bash
+  git add src/ComputeTypes.hpp src/Shaders.metal src/Renderer.cpp
+  git commit -m "feat(compute): implement metal compute kernel with cpu readback"
+  ```
+
+---
+
+## 6. Common Pitfalls & Debugging Checklist
 - **Threadgroup Dimension Exceeds Hardware Limits**:
-  - *Error*: Metal validation layer throws: `threadgroupSize.width (1024) must be <= maxTotalThreadsPerThreadgroup (512)`.
+  - *Error*: `threadgroupSize.width must be <= maxTotalThreadsPerThreadgroup`.
   - *Fix*: Always query `pComputePipeline->maxTotalThreadsPerThreadgroup()` before configuring threadgroup sizes.
 - **Race Condition / Unsynchronized Reads**:
   - *Symptom*: CPU reads old data before the GPU finishes compute execution.
-  - *Fix*: Wait for completion (`cmd->waitUntilCompleted()`) or register an asynchronous `addCompletedHandler`.
-- **Out of Bounds Memory Writes**:
-  - *Symptom*: GPU page fault or OS watchdog resets GPU driver.
-  - *Fix*: Always guard thread indices in MSL: `if (id >= params.particleCount) return;`.
+  - *Fix*: Call `cmd->waitUntilCompleted()` or use `addCompletedHandler` before accessing CPU pointer.

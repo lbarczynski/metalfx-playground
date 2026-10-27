@@ -1,173 +1,135 @@
 # TASK-14: Dynamic Window Resizing & Scaling Presets
 
 ## 1. Concept & Mental Model
-Modern real-time engines allow users to freely resize application windows and toggle between performance-optimized scaling presets. Unlike standard texture sampling where linear filters stretch arbitrarily, `MTLFX::SpatialScaler` is compiled for a fixed $(W_{\text{in}}, H_{\text{in}}) \rightarrow (W_{\text{out}}, H_{\text{out}})$ resolution pair; any dimension change requires tearing down the old scaler, adjusting texture allocations, and recompiling a new scaler instance.
 
-## 2. Mathematical Foundations & Algorithms
-### Scaling Presets & Fill-Rate Ratios
-Presets balance frame rate gains against visual fidelity:
+### Handling Window Resizing in Real-Time
+When the user drags the corner of the window to resize it, the presentation surface dimensions ($W_{\text{out}}, H_{\text{out}}$) change. Because an `MTLFX::SpatialScaler` is compiled for **fixed input and output dimensions**, resizing the window mandates reallocating your render targets and recompiling the scaler.
 
-$$\text{Scale Ratio } s = \frac{W_{\text{in}}}{W_{\text{out}}}$$
+### Industry-Standard Scaling Presets
+Upscaling presets maintain a fixed ratio between the internal rendering resolution and the target window display:
 
-| Preset Mode | Scale Factor ($s$) | Upscale Factor ($R$) | Input from 1440p ($2560 \times 1440$) | Render Cost |
-| :--- | :--- | :--- | :--- | :--- |
-| **Native** | $1.00\times$ | $1.00\times$ | $2560 \times 1440$ | $100\%$ |
-| **Ultra Quality** | $0.77\times$ | $1.30\times$ | $1970 \times 1108$ | $59.3\%$ |
-| **Quality** | $0.67\times$ | $1.50\times$ | $1714 \times 964$ | $44.9\%$ |
-| **Balanced** | $0.58\times$ | $1.72\times$ | $1484 \times 834$ | $33.6\%$ |
-| **Performance** | $0.50\times$ | $2.00\times$ | $1280 \times 720$ | $25.0\%$ |
+$$\text{Scale Factor } S = \frac{W_{\text{in}}}{W_{\text{out}}} = \frac{H_{\text{in}}}{H_{\text{out}}}$$
 
-### Dynamic Aspect Ratio Invariance
-To prevent geometric distortion when resizing windows:
-$$\text{Aspect Ratio } A = \frac{W_{\text{out}}}{H_{\text{out}}}$$
-$$W_{\text{in}} = \max\left(16, \lfloor W_{\text{out}} \cdot s \rfloor \ \& \ \sim 1\right)$$
-$$H_{\text{in}} = \max\left(16, \lfloor H_{\text{out}} \cdot s \rfloor \ \& \ \sim 1\right)$$
-$$\text{Perspective Aspect} = \frac{W_{\text{in}}}{H_{\text{in}}} \approx A$$
+| Preset Mode | Scale Factor ($S$) | Effective Upscale Multiplier | 1080p Target Input Size | Fill-Rate Savings |
+|---|---|---|---|---|
+| **Quality** | $0.67$ ($67\%$) | $1.50\times$ | $1280 \times 720$ | **$55.6\%$** |
+| **Balanced** | $0.58$ ($58\%$) | $1.72\times$ | $1114 \times 626$ | **$66.3\%$** |
+| **Performance** | $0.50$ ($50\%$) | $2.00\times$ | $960 \times 540$ | **$75.0\%$** |
 
-The camera's perspective projection matrix must be updated with $a = \frac{W_{\text{in}}}{H_{\text{in}}}$.
+---
+
+## 2. Resource Reallocation Protocol
+
+To prevent crashes and GPU memory leaks during continuous resizing:
+1. **Drain GPU Work**: Ensure the GPU is not currently reading from the textures being destroyed.
+2. **Release Old Resources**: Call `->release()` on old offscreen color and depth textures, and the old `MTLFX::SpatialScaler`.
+3. **Recompute Input Dimensions**:
+$$W_{\text{in}} = \max(64, \lfloor W_{\text{out}} \times S \rfloor), \quad H_{\text{in}} = \max(64, \lfloor H_{\text{out}} \times S \rfloor)$$
+4. **Reallocate & Compile**: Allocate new textures and create a new `SpatialScaler`.
+5. **Update Projection**: Update camera perspective aspect ratio $a = \frac{W_{\text{out}}}{H_{\text{out}}}$.
+
+---
 
 ## 3. Metal & C++ Blueprint
 
-### 1. Scaling Preset Enumeration
+### Preset Manager (`src/UpscaleManager.hpp`)
 ```cpp
-enum class ScalingPreset {
-    Native       = 0, // 1.00x
-    UltraQuality = 1, // 0.77x
-    Quality      = 2, // 0.67x
-    Balanced     = 3, // 0.58x
-    Performance  = 4  // 0.50x
-};
-
-inline float getScaleFactor(ScalingPreset preset) {
-    switch (preset) {
-        case ScalingPreset::Native:       return 1.00f;
-        case ScalingPreset::UltraQuality: return 0.77f;
-        case ScalingPreset::Quality:      return 0.67f;
-        case ScalingPreset::Balanced:     return 0.58f;
-        case ScalingPreset::Performance:  return 0.50f;
-        default:                          return 1.00f;
-    }
-}
-```
-
-### 2. Scaler Manager Class with Lifecycle Management
-```cpp
+#pragma once
 #include <Metal/Metal.hpp>
 #include <MetalFX/MetalFX.hpp>
+#include <algorithm>
 
-class SpatialUpscaleManager {
+enum class ScalingPreset {
+    Quality,     // 67%
+    Balanced,    // 58%
+    Performance  // 50%
+};
+
+class UpscaleManager {
 public:
-    SpatialUpscaleManager(MTL::Device* pDevice, MTL::PixelFormat outputFormat)
-        : _pDevice(pDevice->retain())
-        , _outputFormat(outputFormat) {}
+    ScalingPreset currentPreset = ScalingPreset::Quality;
 
-    ~SpatialUpscaleManager() {
-        releaseResources();
-        _pDevice->release();
-    }
-
-    void setPreset(ScalingPreset preset) {
-        if (_preset != preset) {
-            _preset = preset;
-            rebuild(true);
+    float scaleFactor() const {
+        switch (currentPreset) {
+            case ScalingPreset::Quality:     return 0.67f;
+            case ScalingPreset::Balanced:    return 0.58f;
+            case ScalingPreset::Performance: return 0.50f;
         }
     }
 
-    void resize(uint32_t outWidth, uint32_t outHeight) {
-        if (_outWidth == outWidth && _outHeight == outHeight) return;
-        _outWidth = outWidth;
-        _outHeight = outHeight;
-        rebuild(false);
-    }
+    void onResize(MTL::Device* pDevice, uint32_t outWidth, uint32_t outHeight) {
+        if (outWidth == 0 || outHeight == 0) return;
 
-    MTLFX::SpatialScaler* getScaler() const { return _pScaler; }
-    MTL::Texture* getColorTexture() const { return _pColorTexture; }
-    MTL::Texture* getDepthTexture() const { return _pDepthTexture; }
-    uint32_t getInputWidth() const { return _inWidth; }
-    uint32_t getInputHeight() const { return _inHeight; }
+        _outputWidth = outWidth;
+        _outputHeight = outHeight;
 
-private:
-    void releaseResources() {
+        uint32_t inWidth = std::max(64u, static_cast<uint32_t>(_outputWidth * scaleFactor()));
+        uint32_t inHeight = std::max(64u, static_cast<uint32_t>(_outputHeight * scaleFactor()));
+
+        // Release old textures and scaler
         if (_pScaler) { _pScaler->release(); _pScaler = nullptr; }
         if (_pColorTexture) { _pColorTexture->release(); _pColorTexture = nullptr; }
         if (_pDepthTexture) { _pDepthTexture->release(); _pDepthTexture = nullptr; }
-    }
 
-    void rebuild(bool force) {
-        if (_outWidth == 0 || _outHeight == 0) return;
-
-        float scale = getScaleFactor(_preset);
-        uint32_t newInW = std::max<uint32_t>(16, static_cast<uint32_t>(_outWidth * scale) & ~1);
-        uint32_t newInH = std::max<uint32_t>(16, static_cast<uint32_t>(_outHeight * scale) & ~1);
-
-        if (!force && newInW == _inWidth && newInH == _inHeight) return;
-
-        _inWidth = newInW;
-        _inHeight = newInH;
-
-        releaseResources();
-
-        // 1. Allocate Low-Res Color Target
+        // Reallocate color texture
         MTL::TextureDescriptor* colorDesc = MTL::TextureDescriptor::texture2DDescriptor(
-            MTL::PixelFormatRGBA8Unorm, _inWidth, _inHeight, false
+            MTL::PixelFormatBGRA8Unorm_sRGB, inWidth, inHeight, false
         );
         colorDesc->setUsage(MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead);
         colorDesc->setStorageMode(MTL::StorageModePrivate);
-        _pColorTexture = _pDevice->newTexture(colorDesc);
+        _pColorTexture = pDevice->newTexture(colorDesc);
         colorDesc->release();
 
-        // 2. Allocate Low-Res Depth Target
+        // Reallocate depth texture
         MTL::TextureDescriptor* depthDesc = MTL::TextureDescriptor::texture2DDescriptor(
-            MTL::PixelFormatDepth32Float, _inWidth, _inHeight, false
+            MTL::PixelFormatDepth32Float, inWidth, inHeight, false
         );
         depthDesc->setUsage(MTL::TextureUsageRenderTarget);
         depthDesc->setStorageMode(MTL::StorageModePrivate);
-        _pDepthTexture = _pDevice->newTexture(depthDesc);
+        _pDepthTexture = pDevice->newTexture(depthDesc);
         depthDesc->release();
 
-        // 3. Compile New Spatial Scaler
-        MTLFX::SpatialScalerDescriptor* scalerDesc = MTLFX::SpatialScalerDescriptor::alloc()->init();
-        scalerDesc->setInputWidth(_inWidth);
-        scalerDesc->setInputHeight(_inHeight);
-        scalerDesc->setOutputWidth(_outWidth);
-        scalerDesc->setOutputHeight(_outHeight);
-        scalerDesc->setColorTextureFormat(MTL::PixelFormatRGBA8Unorm);
-        scalerDesc->setOutputTextureFormat(_outputFormat);
-        scalerDesc->setColorProcessingMode(MTLFX::SpatialScalerColorProcessingModePerceptual);
+        // Recompile scaler
+        MTLFX::SpatialScalerDescriptor* desc = MTLFX::SpatialScalerDescriptor::alloc()->init();
+        desc->setInputWidth(inWidth);
+        desc->setInputHeight(inHeight);
+        desc->setOutputWidth(_outputWidth);
+        desc->setOutputHeight(_outputHeight);
+        desc->setColorTextureFormat(MTL::PixelFormatBGRA8Unorm_sRGB);
+        desc->setOutputTextureFormat(MTL::PixelFormatBGRA8Unorm_sRGB);
+        desc->setColorProcessingMode(MTLFX::SpatialScalerColorProcessingModePerceptual);
 
-        _pScaler = scalerDesc->newSpatialScaler(_pDevice);
-        scalerDesc->release();
+        _pScaler = desc->newSpatialScaler(pDevice);
+        desc->release();
     }
 
-    MTL::Device* _pDevice = nullptr;
-    MTL::PixelFormat _outputFormat;
-    ScalingPreset _preset = ScalingPreset::Quality;
+    MTLFX::SpatialScaler* scaler() const { return _pScaler; }
+    MTL::Texture* colorTexture() const { return _pColorTexture; }
+    MTL::Texture* depthTexture() const { return _pDepthTexture; }
 
-    uint32_t _inWidth = 0;
-    uint32_t _inHeight = 0;
-    uint32_t _outWidth = 0;
-    uint32_t _outHeight = 0;
-
+private:
+    uint32_t _outputWidth = 1280;
+    uint32_t _outputHeight = 720;
     MTLFX::SpatialScaler* _pScaler = nullptr;
     MTL::Texture* _pColorTexture = nullptr;
     MTL::Texture* _pDepthTexture = nullptr;
 };
 ```
 
-## 4. Step-by-Step Implementation Checklist
-- [ ] Implement `ScalingPreset` enum supporting Native, Quality, Balanced, and Performance.
-- [ ] Connect `MTK::ViewDelegate::drawableSizeWillChange` to notify the upscale manager of window dimension changes.
-- [ ] Release old textures and `MTLFX::SpatialScaler` before creating new ones.
-- [ ] Align input dimensions to even integers with `& ~1`.
-- [ ] Update camera perspective projection with the new aspect ratio $a = W_{\text{in}} / H_{\text{in}}$.
-- [ ] Wire keyboard shortcuts (1, 2, 3, 4) to switch presets dynamically at runtime.
-- [ ] Confirm in GPU trace that resizing and switching presets occurs smoothly without memory leaks.
+---
 
-## 5. Common Pitfalls & Debugging Checklist
-- **Memory Leaks on Window Drag Resize**:
-  - *Symptom*: Continuous memory accumulation while dragging the window corner.
-  - *Cause*: Leaking the previous `MTLFX::SpatialScaler` or `MTL::Texture` instances on every resize tick.
-  - *Fix*: Call `release()` on existing resources before allocating new ones.
-- **Zero-Size Window Minimization Crash**:
-  - *Cause*: Attempting to allocate textures or scalers with width or height equal to 0 when window is minimized.
-  - *Fix*: Guard with `if (_outWidth == 0 || _outHeight == 0) return;`.
+## 4. Step-by-Step Implementation Checklist
+- [ ] Connect `Window::ResizeCallback` to trigger `UpscaleManager::onResize()`.
+- [ ] Implement hotkeys ('1' for Quality, '2' for Balanced, '3' for Performance) that trigger scaler recompilation.
+- [ ] Test rapid window dragging: Confirm there are no memory leaks in Activity Monitor and no assertion crashes.
+- [ ] Confirm that aspect ratio remains undistorted across arbitrary window shapes.
+
+---
+
+## 5. Definition of Done & Commit Message
+- **DoD**: Window can be dynamically resized and scaling presets toggled between Quality, Balanced, and Performance in real-time without crashes or memory growth.
+- **Commit**:
+  ```bash
+  git add src/UpscaleManager.hpp src/Renderer.cpp
+  git commit -m "feat(metalfx): implement dynamic window resizing and scaling presets"
+  ```

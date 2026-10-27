@@ -1,32 +1,46 @@
 # TASK-10: GPU Profiling & Metal Capture Infrastructure
 
 ## 1. Concept & Mental Model
-Accurate GPU performance profiling requires extracting true on-chip execution timestamps from the GPU command queue without introducing CPU synchronization stalls, complemented by programmatic capture triggers that export `.gputrace` archives for deep Xcode shader profiling. In OpenGL, timers rely on `glBeginQuery(GL_TIME_ELAPSED)`; in Metal, non-blocking GPU timestamps are retrieved directly via `MTL::CommandBuffer::gpuStartTime()` and `gpuEndTime()`, and programmatic GPU frame capture is orchestrated via `MTL::CaptureManager`.
+
+### The Kotlin / Android Bridge
+In Android, profiling graphics usually involves Android Studio's GPU Inspector, Perfetto system traces, or FrameMetrics API. 
+
+In Modern C++ and Metal:
+- **Non-blocking GPU Timers**: Instead of synchronizing the CPU with the GPU (which ruins performance), Metal command buffers record true hardware execution timestamps asynchronously (`gpuStartTime()` and `gpuEndTime()`).
+- **Programmatic Xcode Capture**: You can programmatically trigger a frame capture using `MTL::CaptureManager`. This saves a `.gputrace` package that you can double-click to open in Xcode's GPU Frame Debugger, displaying every pipeline state, texture attachment, and shader execution timeline down to the microsecond.
+
+---
 
 ## 2. Mathematical Foundations & Algorithms
+
 ### Hardware GPU Execution Duration
-Metal command buffers measure execution in real-time hardware clock ticks converted to fractional seconds (`CFTimeInterval`):
+Metal command buffers measure execution in hardware clock ticks converted to fractional seconds (`CFTimeInterval`):
 $$\Delta t_{\text{gpu}} = t_{\text{gpuEndTime}} - t_{\text{gpuStartTime}} \quad (\text{seconds})$$
 $$\Delta t_{\text{gpu, ms}} = \Delta t_{\text{gpu}} \times 1000.0 \text{ ms}$$
 
 ### Exponential Moving Average (EMA) Frame Profiler
-To display stable timing metrics without single-frame spikes:
+To display stable timing metrics without single-frame fluctuations:
 $$\overline{t}_k = \alpha \cdot t_k + (1 - \alpha) \cdot \overline{t}_{k-1}$$
 $$\text{FPS}_{\text{smoothed}} = \frac{1000.0}{\overline{t}_k \text{ (ms)}}$$
 where $\alpha \approx 0.05$ (equivalent to a $\sim 20$-frame rolling average).
 
+---
+
 ## 3. Metal & C++ Blueprint
 
-### 1. Asynchronous GPU Timestamp Collector
+### 1. Asynchronous GPU Timestamp Collector (`src/GpuProfiler.hpp`)
 ```cpp
+#pragma once
 #include <Metal/Metal.hpp>
 #include <iostream>
 #include <atomic>
+#include <algorithm>
 
 class GpuProfiler {
 public:
     void registerCommandBuffer(MTL::CommandBuffer* pCmd) {
-        pCmd->addCompletedHandler(^(MTL::CommandBuffer* cmd) {
+        // C++ lambda automatically bridges to block under AppleClang -fblocks
+        pCmd->addCompletedHandler([this](MTL::CommandBuffer* cmd) {
             CFTimeInterval start = cmd->GPUStartTime();
             CFTimeInterval end = cmd->GPUEndTime();
             
@@ -59,7 +73,7 @@ public:
     static bool captureFrame(MTL::CommandQueue* pQueue, const char* pOutputFilePath) {
         MTL::CaptureManager* pMgr = MTL::CaptureManager::sharedCaptureManager();
         if (!pMgr->supportsDestination(MTL::CaptureDestinationGPUTraceDocument)) {
-            std::cerr << "GPU Trace capture unsupported on this device.\n";
+            std::cerr << "GPU Trace capture unsupported or METAL_CAPTURE_ENABLED not set.\n";
             return false;
         }
 
@@ -95,43 +109,22 @@ public:
 };
 ```
 
-### 3. Usage in Render Loop
-```cpp
-// Check if user pressed key (e.g., 'C' for Capture)
-if (g_TriggerCaptureNextFrame) {
-    MetalCaptureSession::captureFrame(pQueue, "/tmp/frame_capture.gputrace");
-}
-
-MTL::CommandBuffer* cmd = pQueue->commandBuffer();
-// [Encode render/compute passes...]
-
-profiler.registerCommandBuffer(cmd);
-
-cmd->presentDrawable(drawable);
-cmd->commit();
-
-if (g_TriggerCaptureNextFrame) {
-    MetalCaptureSession::endCapture();
-    g_TriggerCaptureNextFrame = false;
-}
-```
+---
 
 ## 4. Step-by-Step Implementation Checklist
-- [ ] Implement `GpuProfiler` class using `cmd->addCompletedHandler()`.
+- [ ] Implement `GpuProfiler` class registering `addCompletedHandler` on command buffers.
 - [ ] Compute `(gpuEndTime - gpuStartTime) * 1000.0` inside completion handler.
 - [ ] Implement Exponential Moving Average filter ($\alpha = 0.05$) to smooth millisecond readouts.
 - [ ] Implement `MetalCaptureSession` using `MTL::CaptureManager`.
-- [ ] Set `MTL::CaptureDestinationGPUTraceDocument` and define output URL path.
-- [ ] Wire keyboard trigger (e.g. Space or 'C') to start capture before command encoding and stop capture immediately after `commit()`.
+- [ ] Wire a keyboard trigger (e.g. 'C' key) to trigger `captureFrame()` before encoding and `endCapture()` after `commit()`.
 - [ ] Open the resulting `.gputrace` file in Xcode to inspect draw call timings and shader pipeline execution.
 
-## 5. Common Pitfalls & Debugging Checklist
-- **`gpuStartTime` and `gpuEndTime` Return 0.0**:
-  - *Cause*: Attempting to read timestamps before the command buffer completes or inspecting a dropped buffer.
-  - *Fix*: Only access timestamps inside the `addCompletedHandler` callback after checking `start > 0.0 && end > 0.0`.
-- **Capture Fails with "Destination Not Supported"**:
-  - *Cause*: Info.plist lacks Metal capture permissions or `MetalCaptureEnabled` flag is missing in scheme settings.
-  - *Fix*: In Xcode or CLI environment, set `export METAL_CAPTURE_ENABLED=1`.
-- **File Overwrite Error during Capture**:
-  - *Error*: `startCapture` fails if the target `.gputrace` folder already exists on disk.
-  - *Fix*: Delete existing trace files before initiating capture, or generate unique timestamped filenames.
+---
+
+## 5. Definition of Done & Commit Message
+- **DoD**: Application logs live microsecond GPU frame time; pressing 'C' generates a valid `.gputrace` archive inspectable in Xcode Frame Debugger.
+- **Commit**:
+  ```bash
+  git add src/GpuProfiler.hpp src/Renderer.cpp
+  git commit -m "feat(profile): integrate metal gpu profiling and programmatic capture"
+  ```

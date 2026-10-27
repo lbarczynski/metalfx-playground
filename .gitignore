@@ -7,17 +7,12 @@ out/
 *.a
 *.dylib
 
-# CMake temporary files
+# CMake temporary files (when configuring in-source)
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
 Makefile
-*.cmake
-!CMakePresets.json
-!CMakeUserPresets.json
-!tests/CMakeLists.txt
-!src/CMakeLists.txt
-!CMakeLists.txt
+CTestTestfile.cmake
 
 # Package managers
 vcpkg_installed/
