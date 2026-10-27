@@ -1,6 +1,8 @@
 # MetalFX & Modern C++ Learning Playground
 
-A structured, 22-day engineering curriculum designed to build deep mastery in **Modern C++ (C++20)**, **Apple Metal**, and **MetalFX** upscaling on Apple Silicon.
+A structured, 33-session engineering curriculum designed to build deep mastery in **Modern C++ (C++20)**, **Apple Metal**, and **MetalFX** upscaling on Apple Silicon.
+
+Each session is scoped for **30–45 minutes** and concludes with a verifiable milestone and a dedicated git commit.
 
 ---
 
@@ -56,4 +58,4 @@ The repository is pre-configured with a dedicated Socratic mentor agent and 4 wo
 
 ## 📚 Curriculum Plan
 
-See [WORK_PLAN.md](./WORK_PLAN.md) for the complete 22-day curriculum and links to all technical guides in [materials/](./materials/).
+See [WORK_PLAN.md](./WORK_PLAN.md) for the complete 33-session curriculum and links to all technical guides in [materials/](./materials/).

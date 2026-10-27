@@ -1,107 +1,104 @@
 # TASK-12: Configuring the Spatial Scaler Descriptor
 
 ## 1. Concept & Mental Model
-`MTLFX::SpatialScalerDescriptor` is the configuration specification for the spatial upscaling pipeline, establishing exact input/output dimensions, texture pixel formats, and the color processing domain. Analogous to compiling an immutable pipeline state or ML inference graph, `descriptor->newSpatialScaler(device)` compiles a hardware-optimized GPU compute/raster kernel tailored to the exact input-output resolution pair.
 
-## 2. Mathematical Foundations & Algorithms
-### Input Dimension Calculation & Half-Texel Phase Alignment
-Given output presentation dimensions $(W_{\text{out}}, H_{\text{out}})$ and scale factor $s \in [0.33, 1.0]$:
-$$W_{\text{raw}} = \lfloor W_{\text{out}} \cdot s \rfloor, \quad H_{\text{raw}} = \lfloor H_{\text{out}} \cdot s \rfloor$$
+### Scaler Descriptor vs Compiled Scaler
+In MetalFX, setting up upscaling follows a two-stage factory pattern:
+1. **`MTLFX::SpatialScalerDescriptor`**: A configuration blueprint specifying input/output dimensions, pixel formats, and color processing modes.
+2. **`MTLFX::SpatialScaler`**: A compiled GPU filter object compiled by `descriptor->newSpatialScaler(pDevice)`.
 
-To prevent subpixel sampling jitter and phase offsets, input dimensions **must be even integers**:
-$$W_{\text{in}} = \max(16, W_{\text{raw}} \ \& \ \sim 1)$$
-$$H_{\text{in}} = \max(16, H_{\text{raw}} \ \& \ \sim 1)$$
+Creating a compiled scaler takes several milliseconds because Metal compiles internal compute kernels for your exact dimension ratio and pixel format. Therefore, **scalers should be created during initialization or window resize, never every frame**.
 
-### Color Processing Modes
-1. `MTLFX::SpatialScalerColorProcessingModePerceptual`:
-   Input pixels are assumed to be in non-linear perceptual space (gamma-encoded sRGB or tonemapped SDR). Edge gradients evaluate perceptual contrast, matching the human eye's response to shadows and highlights:
-   $$Y = 0.2126 R + 0.7152 G + 0.0722 B$$
-2. `MTLFX::SpatialScalerColorProcessingModeLinear`:
-   Input pixels are linear photometric HDR values (e.g. `RGBA16Float`). MetalFX internally converts to perceptual space for edge detection and converts back to linear space for output.
+---
+
+## 2. Invariants & Texture Usage Requirements
+
+A compiled scaler exposes the exact usage flags required for its input and output textures:
+- `scaler->colorTextureUsage()`: Typically requires `MTL::TextureUsageShaderRead`.
+- `scaler->outputTextureUsage()`: Typically requires `MTL::TextureUsageShaderWrite` (or `ShaderRead | ShaderWrite`).
+
+> [!CAUTION]
+> **The `framebufferOnly` Trap**:
+> By default, `CAMetalLayer.framebufferOnly` is `YES`. Textures with `framebufferOnly` cannot be written to by compute shaders (`ShaderWrite` is disallowed).
+> If you bind `drawable->texture()` directly as the scaler's output texture, you **must set `metalLayer.framebufferOnly = NO;`** in your window setup! Otherwise, Metal validation will crash with:
+> `validateSpatialScaler: Output texture must support MTLTextureUsageShaderWrite`.
+
+---
 
 ## 3. Metal & C++ Blueprint
 
-### 1. Descriptor Initialization & Scaler Instantiation
+### Initializing the Spatial Scaler (`src/SpatialUpscaler.hpp`)
 ```cpp
+#pragma once
 #include <Metal/Metal.hpp>
 #include <MetalFX/MetalFX.hpp>
-#include <stdexcept>
+#include <iostream>
 
-MTLFX::SpatialScaler* createSpatialScaler(
-    MTL::Device* pDevice,
-    uint32_t inW, uint32_t inH,
-    uint32_t outW, uint32_t outH,
-    MTL::PixelFormat colorFormat,
-    MTL::PixelFormat outputFormat,
-    MTLFX::SpatialScalerColorProcessingMode mode
-) {
-    // 1. Allocate and initialize descriptor
-    MTLFX::SpatialScalerDescriptor* pDesc = MTLFX::SpatialScalerDescriptor::alloc()->init();
-    
-    pDesc->setInputWidth(inW);
-    pDesc->setInputHeight(inH);
-    pDesc->setOutputWidth(outW);
-    pDesc->setOutputHeight(outH);
-    pDesc->setColorTextureFormat(colorFormat);
-    pDesc->setOutputTextureFormat(outputFormat);
-    pDesc->setColorProcessingMode(mode);
+class SpatialUpscaler {
+public:
+    SpatialUpscaler(
+        MTL::Device* pDevice,
+        uint32_t inputWidth,
+        uint32_t inputHeight,
+        uint32_t outputWidth,
+        uint32_t outputHeight,
+        MTL::PixelFormat format
+    ) : _pDevice(pDevice) {
+        // 1. Create Descriptor
+        MTLFX::SpatialScalerDescriptor* desc = MTLFX::SpatialScalerDescriptor::alloc()->init();
+        desc->setInputWidth(inputWidth);
+        desc->setInputHeight(inputHeight);
+        desc->setOutputWidth(outputWidth);
+        desc->setOutputHeight(outputHeight);
+        desc->setColorTextureFormat(format);
+        desc->setOutputTextureFormat(format);
+        desc->setColorProcessingMode(MTLFX::SpatialScalerColorProcessingModePerceptual);
 
-    // 2. Validate descriptor configuration
-    if (!MTLFX::SpatialScalerDescriptor::supportsDevice(pDevice)) {
-        pDesc->release();
-        throw std::runtime_error("MetalFX Spatial Scaler unsupported on device.");
+        // 2. Instantiate Compiled Scaler
+        _pScaler = desc->newSpatialScaler(pDevice);
+        desc->release();
+
+        if (!_pScaler) {
+            std::cerr << "CRITICAL: Failed to create MTLFX::SpatialScaler!\n";
+            return;
+        }
+
+        std::cout << ">>> MetalFX Spatial Scaler created successfully: "
+                  << inputWidth << "x" << inputHeight << " -> "
+                  << outputWidth << "x" << outputHeight << "\n";
     }
 
-    // 3. Instantiate compiled scaler object
-    MTLFX::SpatialScaler* pScaler = pDesc->newSpatialScaler(pDevice);
-    
-    // Descriptors are transient and should be released after compilation
-    pDesc->release();
-
-    if (!pScaler) {
-        throw std::runtime_error("Failed to compile MTLFX::SpatialScaler.");
+    ~SpatialUpscaler() {
+        if (_pScaler) {
+            _pScaler->release();
+        }
     }
 
-    return pScaler;
-}
+    MTLFX::SpatialScaler* scaler() const { return _pScaler; }
+    MTL::TextureUsage requiredInputUsage() const { return _pScaler->colorTextureUsage(); }
+    MTL::TextureUsage requiredOutputUsage() const { return _pScaler->outputTextureUsage(); }
+
+private:
+    MTL::Device* _pDevice = nullptr;
+    MTLFX::SpatialScaler* _pScaler = nullptr;
+};
 ```
 
-### 2. Texture Allocations Matching Descriptor Contract
-```cpp
-// 1. Low-Resolution Render Target (Offscreen Scene Buffer)
-MTL::TextureDescriptor* inTexDesc = MTL::TextureDescriptor::texture2DDescriptor(
-    MTL::PixelFormatRGBA8Unorm,
-    inW,
-    inH,
-    false
-);
-// Scaler reads from this texture; Scene pass writes to it
-inTexDesc->setUsage(MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead);
-inTexDesc->setStorageMode(MTL::StorageModePrivate);
-MTL::Texture* pLowResTexture = pDevice->newTexture(inTexDesc);
-inTexDesc->release();
-
-// 2. Output Target is typically the MTKView's currentDrawable()->texture()
-// with matching sRGB format (e.g. MTL::PixelFormatBGRA8Unorm if input is RGBA8Unorm, or both _sRGB)
-// Note: MetalFX disallows mixing non-sRGB input with sRGB output.
-```
+---
 
 ## 4. Step-by-Step Implementation Checklist
-- [ ] Determine output resolution from `pView->drawableSize()` (e.g. $1920 \times 1080$).
-- [ ] Compute input resolution for a 50% scale factor ($960 \times 540$) enforced to even integers with `& ~1`.
-- [ ] Allocate `MTLFX::SpatialScalerDescriptor`.
-- [ ] Populate input and output dimensions on the descriptor.
-- [ ] Configure `colorTextureFormat` (`MTL::PixelFormatRGBA8Unorm`) and `outputTextureFormat` (`pView->colorPixelFormat()`).
-- [ ] Set `setColorProcessingMode(MTLFX::SpatialScalerColorProcessingModePerceptual)`.
-- [ ] Instantiate `MTLFX::SpatialScaler* pScaler = pDesc->newSpatialScaler(pDevice)`.
-- [ ] Call `pDesc->release()` immediately after instantiation.
+- [ ] In `src/platform/WindowBridge.mm`, set `metalLayer.framebufferOnly = NO;`.
+- [ ] Configure `MTLFX::SpatialScalerDescriptor` for 540p ($960 \times 540$) input and 1080p ($1920 \times 1080$) output.
+- [ ] Compile the scaler using `desc->newSpatialScaler(pDevice)`.
+- [ ] Verify `_pScaler != nullptr`.
+- [ ] Log `scaler->colorTextureUsage()` and `scaler->outputTextureUsage()` to confirm required flags.
 
-## 5. Common Pitfalls & Debugging Checklist
-- **Metal Validation Layer Error: Scaler / Texture Dimension Mismatch**:
-  - *Error*: `Input texture width (959) does not match spatial scaler input width (960)`.
-  - *Fix*: The texture bound at runtime must match the descriptor's width and height **exactly**.
-- **Pixel Format Mismatch Crash**:
-  - *Error*: `outputTextureFormat does not match output texture pixel format`.
-  - *Fix*: Ensure `pDesc->setOutputTextureFormat()` matches `pView->colorPixelFormat()` (often `BGRA8Unorm_sRGB` on macOS).
-- **Compiling Scaler Every Frame**:
-  - *Performance Pitfall*: Calling `newSpatialScaler()` inside `drawInMTKView()` incurs massive CPU pipeline compilation stalls ($50\text{–}200\text{ ms}$). Compile once during initialization or resize.
+---
+
+## 5. Definition of Done & Commit Message
+- **DoD**: `MTLFX::SpatialScaler` compiles successfully for low-res input to target window dimensions, with `framebufferOnly = NO` configured.
+- **Commit**:
+  ```bash
+  git add src/SpatialUpscaler.hpp src/platform/WindowBridge.mm src/Renderer.cpp
+  git commit -m "feat(metalfx): configure spatial scaler descriptor and instantiate scaler"
+  ```

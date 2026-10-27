@@ -1,49 +1,48 @@
 # TASK-13: Encoding the Spatial Scaler Pass
 
 ## 1. Concept & Mental Model
-Executing MetalFX Spatial involves binding the low-resolution color texture and high-resolution destination drawable onto the scaler instance and encoding its internal compute kernel into the active command buffer. Unlike graphics passes that open and close an `MTL::RenderCommandEncoder`, MetalFX encodes directly at the `MTL::CommandBuffer` level, managing internal GPU memory barriers and execution scheduling automatically.
 
-## 2. Mathematical Foundations & Algorithms
-### GPU Pipeline Sequencing & Hazard Management
-The low-resolution color texture experiences two distinct GPU access phases during a single frame:
-$$\text{Phase 1: Scene Rasterization} \longrightarrow \text{Write access to } T_{\text{lowres}} \text{ via Tile Color Attachment}$$
-$$\text{Execution Boundary} \longrightarrow \text{Encoder End establishes tile writeback fence}$$
-$$\text{Phase 2: MetalFX Upscale} \longrightarrow \text{Read access to } T_{\text{lowres}} \text{ via Texture Sampling Units}$$
+### Command Buffer Level Encoding
+Unlike graphics passes that operate inside an `MTL::RenderCommandEncoder`, or compute kernels inside an `MTL::ComputeCommandEncoder`, MetalFX scalers encode **directly onto the `MTL::CommandBuffer`**:
 
-Calling `pRenderEncoder->endEncoding()` prior to `pScaler->encodeToCommandBuffer(cmd)` signals the Metal driver to flush tile cache lines, preventing Read-After-Write (RAW) data hazards.
+```cpp
+pScaler->encodeToCommandBuffer(cmd);
+```
+
+Under the hood, Apple Silicon inserts internal compute dispatches, memory fences, and cache synchronization barriers. 
+
+> [!CAUTION]
+> You **cannot** call `pScaler->encodeToCommandBuffer(cmd)` while any other command encoder is currently active on that command buffer. You must explicitly call `enc->endEncoding()` on Pass 1 before encoding the MetalFX pass.
+
+---
+
+## 2. Multi-Pass Frame Orchestration
 
 ```
 [ Command Buffer ]
-├── RenderPassEncoder (Scene -> LowResTexture)
-│   ├── setRenderPipelineState
-│   ├── drawIndexedPrimitives
-│   └── endEncoding()  <--- HAZARD BARRIER FLUSH
-├── MetalFX Spatial Pass
-│   ├── scaler->setColorTexture(LowResTexture)
-│   ├── scaler->setOutputTexture(DrawableTexture)
-│   └── scaler->encodeToCommandBuffer()
-└── presentDrawable(Drawable) & commit()
+├── RenderPassEncoder (Pass 1: 3D Scene -> LowRes 540p Texture)
+│   ├── setRenderPipelineState(3D)
+│   ├── drawIndexedPrimitives(Cube)
+│   └── endEncoding()  <── CRITICAL: FLUSHES TILE CACHE LINES TO VRAM
+│
+├── MetalFX Spatial Pass (Pass 2)
+│   ├── pScaler->setColorTexture(LowResTexture)
+│   ├── pScaler->setOutputTexture(DrawableTexture)
+│   └── pScaler->encodeToCommandBuffer(cmd)
+│
+└── presentDrawable(pDrawable) & commit()
 ```
+
+---
 
 ## 3. Metal & C++ Blueprint
 
-### 1. Complete Multi-Pass Render Loop
+### Frame Execution (`src/Renderer.cpp`)
 ```cpp
-void renderFrame(
-    MTK::View* pView,
-    MTL::CommandQueue* pQueue,
-    MTLFX::SpatialScaler* pScaler,
-    MTL::Texture* pLowResColorTexture,
-    MTL::Texture* pLowResDepthTexture,
-    MTL::RenderPipelineState* pScenePipeline,
-    MTL::DepthStencilState* pDepthState,
-    MTL::Buffer* pVertexBuffer,
-    MTL::Buffer* pIndexBuffer,
-    MTL::Buffer* pUniformBuffer
-) {
+void renderFrame() {
     NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
 
-    CA::MetalDrawable* pDrawable = pView->currentDrawable();
+    CA::MetalDrawable* pDrawable = pLayer->nextDrawable();
     if (!pDrawable) {
         pool->release();
         return;
@@ -52,41 +51,37 @@ void renderFrame(
     MTL::CommandBuffer* cmd = pQueue->commandBuffer();
 
     // ========================================================
-    // PASS 1: Render 3D Scene into Low-Resolution Render Target
+    // PASS 1: Render 3D Scene to Low-Res Offscreen Target
     // ========================================================
     MTL::RenderPassDescriptor* scenePass = MTL::RenderPassDescriptor::renderPassDescriptor();
-    
-    // Color attachment configuration
     auto colorAttach = scenePass->colorAttachments()->object(0);
     colorAttach->setTexture(pLowResColorTexture);
     colorAttach->setLoadAction(MTL::LoadActionClear);
-    colorAttach->setStoreAction(MTL::StoreActionStore); // CRITICAL: Retain for MetalFX read
+    colorAttach->setStoreAction(MTL::StoreActionStore); // Retain for MetalFX read
     colorAttach->setClearColor(MTL::ClearColor::Make(0.05, 0.05, 0.08, 1.0));
 
-    // Depth attachment configuration
     auto depthAttach = scenePass->depthAttachment();
     depthAttach->setTexture(pLowResDepthTexture);
     depthAttach->setLoadAction(MTL::LoadActionClear);
     depthAttach->setStoreAction(MTL::StoreActionDontCare);
     depthAttach->setClearDepth(1.0);
 
-    MTL::RenderCommandEncoder* enc = cmd->renderCommandEncoder(scenePass);
-    enc->setRenderPipelineState(pScenePipeline);
-    enc->setDepthStencilState(pDepthState);
-    enc->setVertexBuffer(pVertexBuffer, 0, 0);
-    enc->setVertexBuffer(pUniformBuffer, 0, 1);
+    MTL::RenderCommandEncoder* sceneEnc = cmd->renderCommandEncoder(scenePass);
+    sceneEnc->setRenderPipelineState(p3DPipeline);
+    sceneEnc->setDepthStencilState(pDepthState);
+    sceneEnc->setVertexBuffer(pCubeVertexBuffer, 0, 0);
+    sceneEnc->setVertexBuffer(pUniformBuffer, 0, 1);
+    sceneEnc->drawIndexedPrimitives(MTL::PrimitiveTypeTriangle, 36, MTL::IndexTypeUInt16, pCubeIndexBuffer, 0);
     
-    enc->drawIndexedPrimitives(MTL::PrimitiveTypeTriangle, 36, MTL::IndexTypeUInt16, pIndexBuffer, 0);
-    
-    // MUST end encoding before MetalFX encoding begins
-    enc->endEncoding();
+    // MUST end encoding before MetalFX starts
+    sceneEnc->endEncoding();
 
     // ========================================================
-    // PASS 2: Encode MetalFX Spatial Upscaler
+    // PASS 2: MetalFX Spatial Upscaling Pass
     // ========================================================
-    pScaler->setColorTexture(pLowResColorTexture);
-    pScaler->setOutputTexture(pDrawable->texture());
-    pScaler->encodeToCommandBuffer(cmd);
+    pSpatialScaler->setColorTexture(pLowResColorTexture);
+    pSpatialScaler->setOutputTexture(pDrawable->texture());
+    pSpatialScaler->encodeToCommandBuffer(cmd);
 
     // ========================================================
     // PRESENTATION
@@ -98,25 +93,23 @@ void renderFrame(
 }
 ```
 
-## 4. Step-by-Step Implementation Checklist
-- [ ] Configure scene render pass descriptor using `pLowResColorTexture` as color attachment 0.
-- [ ] Set `setStoreAction(MTL::StoreActionStore)` on the scene color attachment.
-- [ ] Encode all geometry draw calls into the scene render pass.
-- [ ] Explicitly call `enc->endEncoding()` to finalize the scene pass.
-- [ ] Retrieve `pView->currentDrawable()`.
-- [ ] Call `pScaler->setColorTexture(pLowResColorTexture)`.
-- [ ] Call `pScaler->setOutputTexture(pDrawable->texture())`.
-- [ ] Call `pScaler->encodeToCommandBuffer(cmd)`.
-- [ ] Present drawable and commit command buffer.
-- [ ] Verify that the scene is rendered at low resolution and upscaled to the full display window.
+---
 
-## 5. Common Pitfalls & Debugging Checklist
-- **Black Screen from Discarded Pixels**:
-  - *Cause*: Leaving color attachment store action as `StoreActionDontCare`. The GPU discards tile contents on pass completion.
-  - *Fix*: Set `colorAttach->setStoreAction(MTL::StoreActionStore)`.
-- **Active Encoder Conflict Assertion**:
-  - *Error*: `Encoding to command buffer while another encoder (MTLRenderCommandEncoder) is active`.
-  - *Fix*: Ensure `enc->endEncoding()` is called before `pScaler->encodeToCommandBuffer(cmd)`.
-- **Texture Usage Assertion Failure**:
-  - *Error*: `Color texture must have MTLTextureUsageShaderRead enabled`.
-  - *Fix*: Ensure the input texture was allocated with `MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead`.
+## 4. Step-by-Step Implementation Checklist
+- [ ] Connect `pLowResColorTexture` as color attachment 0 of Pass 1 with `StoreActionStore`.
+- [ ] Draw the 3D lit cube into Pass 1 and call `sceneEnc->endEncoding()`.
+- [ ] Bind `pLowResColorTexture` to `pSpatialScaler->setColorTexture(...)`.
+- [ ] Bind `pDrawable->texture()` to `pSpatialScaler->setOutputTexture(...)`.
+- [ ] Encode the upscaler: `pSpatialScaler->encodeToCommandBuffer(cmd)`.
+- [ ] Present drawable and commit.
+- [ ] Run application: The 3D scene renders at 540p and is upscaled cleanly in real-time to the native window.
+
+---
+
+## 5. Definition of Done & Commit Message
+- **DoD**: 3D scene renders into a 540p texture and is upscaled in real-time via MetalFX Spatial to the display without validation layer warnings.
+- **Commit**:
+  ```bash
+  git add src/Renderer.cpp
+  git commit -m "feat(metalfx): encode spatial upscaler pass into command buffer"
+  ```

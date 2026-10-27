@@ -1,90 +1,112 @@
-# TASK-16: Temporal Scaler Theory & Descriptor Requirements
+# TASK-16: Temporal Scaler Architecture & Requirements
 
 ## 1. Concept & Mental Model
-MetalFX Temporal accumulates subpixel samples across successive frames into an internal history buffer to reconstruct high-frequency geometric detail and texture sharpness well beyond the Nyquist limit of the low-resolution render target. Analogous to NVIDIA DLSS 2+ and AMD FSR 2+, Apple MetalFX Temporal leverages Apple Silicon GPU and Neural Engine hardware, consuming jittered color, depth, and screen-space motion vectors to output a temporally stabilized, anti-aliased high-resolution frame.
 
-## 2. Mathematical Foundations & Algorithms
-### Nyquist-Shannon Sampling & Aliasing in Rasterization
-A discrete raster grid of pixel spacing $\Delta x$ imposes a spatial Nyquist cutoff frequency:
-$$f_N = \frac{1}{2 \Delta x}$$
+### Why Temporal Upscaling Outperforms Spatial
+Spatial upscaling (MetalFX Spatial, FSR 1.0) inspects only a single frame: it has no way of knowing what details exist between two low-resolution pixels, so it can only sharpen existing edges.
 
-Frequencies in geometric edges and fine textures higher than $f_N$ fold back into low frequencies, creating jagged edges and moiré patterns. By jittering camera subpixel offsets $\delta_k \in [-0.5, 0.5]\Delta x$ across $K$ consecutive frames, the effective spatial sampling rate increases by a factor of $K$:
-$$f_{N,\text{effective}} = \frac{K}{2 \Delta x} = K \cdot f_N$$
+**Temporal Super-Resolution (MetalFX Temporal, DLSS 2+, FSR 2+)** accumulates subpixel details over time:
+- In each frame, the camera projection matrix is shifted slightly by a subpixel fraction (subpixel camera jitter).
+- Each new frame captures a unique phase of the 3D scene geometry.
+- By tracking how pixels moved since the previous frame (using **Motion Vectors**) and verifying surface occlusions (using **Depth**), MetalFX Temporal reconstructs an image with sharpness and fidelity rivaling or exceeding native high-resolution rendering!
 
-### Exponential Temporal Accumulation
-For pixel coordinate $\mathbf{x} = (x, y)$ with motion vector $\mathbf{v}(\mathbf{x})$:
-$$\mathbf{C}_{\text{accum}}(\mathbf{x}) = \alpha \cdot \mathbf{C}_{\text{curr}}(\mathbf{x}) + (1.0 - \alpha) \cdot \mathbf{C}_{\text{history}}(\mathbf{x} - \mathbf{v}(\mathbf{x}))$$
-where blend weight $\alpha \in [0.05, 0.10]$ allows the reconstructor to weigh new subpixel information against historical samples.
+---
+
+## 2. The 4 Required Attachments & Invariants
+
+| Attachment | Recommended Format | Purpose in Temporal Reconstruction | Required Usage Flags |
+|---|---|---|---|
+| **Color Texture** | `RGBA16Float` or `BGRA8Unorm_sRGB` | Current frame low-res shaded scene | `RenderTarget \| ShaderRead` |
+| **Depth Texture** | `MTL::PixelFormatDepth32Float` | Identifies surface occlusions and disocclusions | `RenderTarget \| ShaderRead` |
+| **Motion Texture** | `MTL::PixelFormatRG16Float` | 2D velocity vectors tracking pixel displacement | `RenderTarget \| ShaderRead` |
+| **Output Texture** | `BGRA8Unorm_sRGB` or `RGBA16Float` | High-res reconstructed destination | `scaler->outputTextureUsage()` |
+
+> [!IMPORTANT]
+> Both the depth and motion vector textures **must** be allocated with `MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead`. If `ShaderRead` is omitted, the MetalFX compute kernel cannot read them, triggering a Metal validation abort.
+
+---
 
 ## 3. Metal & C++ Blueprint
 
-### 1. Temporal Scaler Descriptor Configuration
+### Querying Support & Creating the Temporal Scaler (`src/TemporalUpscaler.hpp`)
 ```cpp
+#pragma once
 #include <Metal/Metal.hpp>
 #include <MetalFX/MetalFX.hpp>
-#include <stdexcept>
+#include <iostream>
 
-MTLFX::TemporalScaler* createTemporalScaler(
-    MTL::Device* pDevice,
-    uint32_t inW, uint32_t inH,
-    uint32_t outW, uint32_t outH,
-    MTL::PixelFormat colorFormat,
-    MTL::PixelFormat outputFormat
-) {
-    if (!MTLFX::TemporalScalerDescriptor::supportsDevice(pDevice)) {
-        throw std::runtime_error("MetalFX Temporal Scaler unsupported on device.");
+class TemporalUpscaler {
+public:
+    TemporalUpscaler(
+        MTL::Device* pDevice,
+        uint32_t inWidth,
+        uint32_t inHeight,
+        uint32_t outWidth,
+        uint32_t outHeight
+    ) : _pDevice(pDevice) {
+        if (!MTLFX::TemporalScalerDescriptor::supportsDevice(pDevice)) {
+            std::cerr << "CRITICAL: MetalFX Temporal Scaler unsupported on this device!\n";
+            return;
+        }
+
+        // Configure Descriptor
+        MTLFX::TemporalScalerDescriptor* desc = MTLFX::TemporalScalerDescriptor::alloc()->init();
+        desc->setInputWidth(inWidth);
+        desc->setInputHeight(inHeight);
+        desc->setOutputWidth(outWidth);
+        desc->setOutputHeight(outHeight);
+
+        desc->setColorTextureFormat(MTL::PixelFormatBGRA8Unorm_sRGB);
+        desc->setDepthTextureFormat(MTL::PixelFormatDepth32Float);
+        desc->setMotionTextureFormat(MTL::PixelFormatRG16Float);
+        desc->setOutputTextureFormat(MTL::PixelFormatBGRA8Unorm_sRGB);
+
+        // Compile Scaler
+        _pScaler = desc->newTemporalScaler(pDevice);
+        desc->release();
+
+        if (!_pScaler) {
+            std::cerr << "CRITICAL: Failed to create MTLFX::TemporalScaler!\n";
+            return;
+        }
+
+        // Configure Reversed-Z depth mode
+        _pScaler->setDepthReversed(true);
+
+        std::cout << ">>> MetalFX Temporal Scaler initialized: "
+                  << inWidth << "x" << inHeight << " -> "
+                  << outWidth << "x" << outHeight << "\n";
     }
 
-    MTLFX::TemporalScalerDescriptor* pDesc = MTLFX::TemporalScalerDescriptor::alloc()->init();
-    
-    pDesc->setInputWidth(inW);
-    pDesc->setInputHeight(inH);
-    pDesc->setOutputWidth(outW);
-    pDesc->setOutputHeight(outH);
-    
-    pDesc->setColorTextureFormat(colorFormat);                      // e.g. MTL::PixelFormatRGBA16Float
-    pDesc->setDepthTextureFormat(MTL::PixelFormatDepth32Float);      // Strict requirement: 32-bit float
-    pDesc->setMotionTextureFormat(MTL::PixelFormatRG16Float);        // 2D Screen-space motion vectors
-    pDesc->setOutputTextureFormat(outputFormat);                     // e.g. MTL::PixelFormatBGRA8Unorm_sRGB
-    
-    MTLFX::TemporalScaler* pScaler = pDesc->newTemporalScaler(pDevice);
-    pDesc->release();
-
-    if (!pScaler) {
-        throw std::runtime_error("Failed to compile MTLFX::TemporalScaler.");
+    ~TemporalUpscaler() {
+        if (_pScaler) {
+            _pScaler->release();
+        }
     }
 
-    // Reversed-Z is strongly recommended for floating-point depth precision (configured on scaler instance)
-    pScaler->setDepthReversed(true);
+    MTLFX::TemporalScaler* scaler() const { return _pScaler; }
 
-    return pScaler;
-}
+private:
+    MTL::Device* _pDevice = nullptr;
+    MTLFX::TemporalScaler* _pScaler = nullptr;
+};
 ```
 
-### 2. Texture Attachment Requirements Matrix
-| Target Attachment | Format | Required Usage Flags | Storage Mode |
-| :--- | :--- | :--- | :--- |
-| **Color Texture** | `RGBA16Float` or `RGBA8Unorm` | `RenderTarget \| ShaderRead` | `StorageModePrivate` |
-| **Depth Texture** | `Depth32Float` | `RenderTarget \| ShaderRead` | `StorageModePrivate` |
-| **Motion Texture** | `RG16Float` | `RenderTarget \| ShaderRead` | `StorageModePrivate` |
-| **Output Texture** | `BGRA8Unorm_sRGB` or `RGBA16Float` | `RenderTarget \| ShaderRead` | `StorageModePrivate` / Drawable |
+---
 
 ## 4. Step-by-Step Implementation Checklist
-- [ ] Add `MTLFX::TemporalScalerDescriptor::supportsDevice(pDevice)` query in startup diagnostics.
-- [ ] Allocate `MTLFX::TemporalScalerDescriptor`.
-- [ ] Set input dimensions (e.g. $960 \times 540$) and output dimensions (e.g. $1920 \times 1080$).
-- [ ] Configure `colorTextureFormat` (`RGBA16Float`), `depthTextureFormat` (`Depth32Float`), and `motionTextureFormat` (`RG16Float`).
-- [ ] Set `pScaler->setDepthReversed(true)`.
-- [ ] Instantiate `MTLFX::TemporalScaler* pScaler = pDesc->newTemporalScaler(pDevice)`.
-- [ ] Release descriptor and cache scaler instance.
+- [ ] Call `MTLFX::TemporalScalerDescriptor::supportsDevice(pDevice)` to verify hardware support.
+- [ ] Configure `MTLFX::TemporalScalerDescriptor` with the 4 required pixel formats.
+- [ ] Compile the scaler via `desc->newTemporalScaler(pDevice)`.
+- [ ] Call `_pScaler->setDepthReversed(true)`.
+- [ ] Verify `_pScaler != nullptr` and log successful initialization to the console.
 
-## 5. Common Pitfalls & Debugging Checklist
-- **`Depth32Float` Format Requirement**:
-  - *Error*: Validation layer asserts invalid depth format if using `Depth16Unorm` or `Depth24Unorm_Stencil8`.
-  - *Fix*: MetalFX Temporal strictly mandates `MTL::PixelFormatDepth32Float`.
-- **Missing `ShaderRead` Usage on Depth/Motion Attachments**:
-  - *Symptom*: Fatal pipeline assertion when encoding scaler.
-  - *Fix*: Both depth and velocity textures must specify `MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead`.
-- **Frame History Smearing on Startup**:
-  - *Cause*: Uninitialized history buffer on first frame.
-  - *Fix*: Set `pScaler->setReset(true)` on the first frame of execution.
+---
+
+## 5. Definition of Done & Commit Message
+- **DoD**: MetalFX Temporal Scaler hardware capability is queried, and an `MTLFX::TemporalScaler` instance is successfully initialized and configured with Reversed-Z enabled.
+- **Commit**:
+  ```bash
+  git add src/TemporalUpscaler.hpp src/main.cpp
+  git commit -m "feat(metalfx): configure temporal scaler descriptor and verify inputs"
+  ```

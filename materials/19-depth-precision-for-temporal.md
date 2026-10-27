@@ -1,78 +1,98 @@
-# TASK-19: Depth Precision & Reversed-Z Configuration
+# TASK-19: Reversed-Z Depth Precision for Temporal
 
 ## 1. Concept & Mental Model
-Temporal reconstruction relies on subpixel depth accuracy along silhouette boundaries to prevent background colors from bleeding onto foreground objects during camera motion. In classical OpenGL, the near plane maps to $0.0$ and far to $1.0$, which wastes floating-point precision on geometry immediately adjacent to the camera; Reversed-Z maps the near plane to $1.0$ and far plane to $0.0$, exploiting IEEE 754 floating-point exponent distributions to achieve near-uniform precision across the entire view frustum.
 
-## 2. Mathematical Foundations & Algorithms
-### IEEE 754 Floating-Point Distribution
-A 32-bit float distributes its $2^{24}$ discrete mantissa values exponentially: half of all representable floating-point numbers lie within $[0.0, 1.0]$, and half of *those* lie within $[0.5, 1.0]$.
+### The Floating-Point Depth Problem
+In IEEE 754 floating-point numbers, roughly half of all representable values exist between $[-1.0, 1.0]$, with density clustering dramatically near zero.
 
-In Standard Z ($z_{\text{ndc}} \in [0.0, 1.0]$, $z_{\text{near}} \rightarrow 0, z_{\text{far}} \rightarrow 1$):
-$$z_{\text{ndc}} = \frac{f}{f - n} - \frac{f n}{(f - n) z_{\text{eye}}}$$
-The non-linear $1/z$ curve compresses over $90\%$ of available float precision into the first $5\%$ of the camera distance.
+In standard perspective projection, depth is non-linear:
+$$z_{\text{ndc}} = \frac{f}{f - n} - \frac{n \cdot f}{(f - n) \cdot z_{\text{eye}}}$$
 
-In **Reversed-Z** ($z_{\text{ndc}} \in [1.0, 0.0]$, $z_{\text{near}} \rightarrow 1.0, z_{\text{far}} \rightarrow 0.0$):
-$$z_{\text{ndc}} = \frac{n}{n - f} - \frac{f n}{(n - f) z_{\text{eye}}}$$
-For an infinite far plane ($f \rightarrow \infty$):
-$$z_{\text{ndc}} = \frac{n}{z_{\text{eye}}}$$
-The reciprocal nature of perspective projection ($1/z$) directly cancels out the exponential concentration of IEEE 754 floats near $0.0$, yielding nearly constant relative depth precision across the entire frustum.
+When mapping near $n \to 0.0$ and far $f \to 1.0$:
+- Over **$90\%$** of all float precision is wasted in the first $10\%$ of distance in front of the camera lens!
+- Objects further away share identical depth bits, causing severe **Z-fighting** (flickering surfaces).
+- Temporal upscalers rely on precise depth differences to detect geometry disocclusions. Standard Z causes false disocclusion triggers and severe ghosting.
 
-### Reversed-Z Perspective Matrix Layout (Metal Left-Handed, Eye Looking Down $-Z$)
-Given vertical FOV $\theta$, aspect ratio $a = W/H$, near plane $n$, and far plane $f$:
-$$f_t = \frac{1}{\tan(\theta / 2)}$$
-$$\mathbf{P}_{\text{RevZ}} = \begin{bmatrix}
-\frac{f_t}{a} & 0 & 0 & 0 \\
-0 & f_t & 0 & 0 \\
-0 & 0 & \frac{n}{f - n} & \frac{f \cdot n}{f - n} \\
-0 & 0 & -1 & 0
+---
+
+## 2. Mathematical Foundations: The Reversed-Z Solution
+
+By mapping near plane $n \to 1.0$ and far plane $f \to 0.0$, the logarithmic distribution of IEEE 754 floating-point exponents perfectly cancels out the non-linear $\frac{1}{z}$ perspective divide!
+
+### Reversed-Z Perspective Matrix ($n \to 1, f \to 0$):
+$$\mathbf{P}_{\text{revZ}} = \begin{bmatrix}
+\frac{S}{a} & 0 & 0 & 0 \\
+0 & S & 0 & 0 \\
+0 & 0 & \frac{n}{n - f} & \frac{-f \cdot n}{n - f} \\
+0 & 0 & 1 & 0
 \end{bmatrix}$$
+*(With an infinite far plane $f \to \infty$, this simplifies to $\mathbf{P}[2][2] = 0, \mathbf{P}[3][2] = n$.)*
 
-*Derivation check*: When $z_{\text{eye}} = -n \implies z_{\text{ndc}} = 1.0$; when $z_{\text{eye}} = -f \implies z_{\text{ndc}} = 0.0$.
+---
 
-## 3. Metal & C++ Blueprint
+## 3. Metal Configuration Rules
 
-### 1. Depth Stencil State with Inverted Comparison
+To switch a Metal pipeline to Reversed-Z:
+
+| Property | Standard Z | Reversed-Z (Mandated by MetalFX) |
+|---|---|---|
+| **Depth Clear Value** | `1.0` | **`0.0`** (`passDesc->setClearDepth(0.0)`) |
+| **Compare Function** | `CompareFunctionLess` | **`CompareFunctionGreaterEqual`** |
+| **Depth Format** | `Depth16Unorm` / `Depth32Float` | Strictly **`MTL::PixelFormatDepth32Float`** |
+| **MetalFX Flag** | `setDepthReversed(false)` | **`pScaler->setDepthReversed(true)`** |
+
+---
+
+## 4. Metal & C++ Blueprint
+
+### 1. Reversed-Z Matrix Helper (`src/SimdMath.hpp`)
 ```cpp
+inline simd::float4x4 makeReversedZPerspective(float fovRadians, float aspect, float nearZ, float farZ) {
+    float s = 1.0f / std::tan(fovRadians * 0.5f);
+    simd::float4x4 m = { 0 };
+    m.columns[0] = simd::make_float4(s / aspect, 0.0f, 0.0f, 0.0f);
+    m.columns[1] = simd::make_float4(0.0f, s, 0.0f, 0.0f);
+    m.columns[2] = simd::make_float4(0.0f, 0.0f, nearZ / (nearZ - farZ), 1.0f);
+    m.columns[3] = simd::make_float4(0.0f, 0.0f, (-farZ * nearZ) / (nearZ - farZ), 0.0f);
+    return m;
+}
+```
+
+### 2. Depth State & Pass Setup
+```cpp
+// 1. Configure Depth Stencil State with GreaterEqual
 MTL::DepthStencilDescriptor* dsDesc = MTL::DepthStencilDescriptor::alloc()->init();
-// Inverted from Less to GreaterEqual for Reversed-Z
 dsDesc->setDepthCompareFunction(MTL::CompareFunctionGreaterEqual);
 dsDesc->setDepthWriteEnabled(true);
-
 MTL::DepthStencilState* pReversedZDepthState = pDevice->newDepthStencilState(dsDesc);
 dsDesc->release();
-```
 
-### 2. Render Pass Depth Clear Configuration
-```cpp
-// Clear depth buffer to 0.0 (the furthest possible depth in Reversed-Z)
+// 2. In renderFrame():
 passDesc->depthAttachment()->setTexture(pLowResDepthTexture);
-passDesc->depthAttachment()->setClearDepth(0.0); // NOT 1.0!
+passDesc->depthAttachment()->setClearDepth(0.0); // 0.0 = Far plane in Reversed-Z
 passDesc->depthAttachment()->setLoadAction(MTL::LoadActionClear);
 passDesc->depthAttachment()->setStoreAction(MTL::StoreActionStore); // Retain for MetalFX
-```
 
-### 3. Temporal Scaler Reversed-Z Configuration
-```cpp
-pTemporalDesc->setDepthTextureFormat(MTL::PixelFormatDepth32Float);
-
-// On compiled scaler instance:
+// 3. Configure Scaler
 pTemporalScaler->setDepthReversed(true);
 ```
 
-## 4. Step-by-Step Implementation Checklist
-- [ ] Implement `makeReversedZPerspective(fovy, aspect, near, far)`.
-- [ ] Update `MTL::DepthStencilDescriptor` compare function to `MTL::CompareFunctionGreaterEqual`.
-- [ ] Set `passDesc->depthAttachment()->setClearDepth(0.0)`.
-- [ ] Call `pTemporalScaler->setDepthReversed(true)` on the compiled scaler instance.
-- [ ] Verify in Xcode GPU capture that foreground geometry has depth values near $1.0$ and background objects approach $0.0$.
+---
 
-## 5. Common Pitfalls & Debugging Checklist
-- **All Geometry Disappears (Black Screen)**:
-  - *Cause*: Leaving `clearDepth` at $1.0$ while using `CompareFunctionGreaterEqual`. Everything fails the depth test against $1.0$.
-  - *Fix*: Clear depth to `0.0`.
-- **Z-Fighting on Distant Mountains/Backgrounds**:
-  - *Cause*: Using `MTL::PixelFormatDepth16Unorm` with Reversed-Z.
-  - *Fix*: Reversed-Z benefits require 32-bit floating-point depth (`MTL::PixelFormatDepth32Float`).
-- **Temporal Scaler Blur on Edges**:
-  - *Cause*: Mismatch between projection matrix Reversed-Z configuration and `pTemporalScaler->setDepthReversed()`.
-  - *Fix*: Ensure both C++ projection matrix and MetalFX scaler instance agree on Reversed-Z.
+## 5. Step-by-Step Implementation Checklist
+- [ ] Implement `makeReversedZPerspective()` in `src/SimdMath.hpp`.
+- [ ] Configure `MTL::DepthStencilState` with `CompareFunctionGreaterEqual`.
+- [ ] Set `clearDepth = 0.0` on render pass depth attachment.
+- [ ] Set `setStoreAction(MTL::StoreActionStore)` on depth attachment so MetalFX can read it.
+- [ ] Call `pTemporalScaler->setDepthReversed(true)`.
+- [ ] Verify: 3D scene renders with flawless depth sorting, and near/far planes are properly preserved.
+
+---
+
+## 6. Definition of Done & Commit Message
+- **DoD**: Reversed-Z depth buffer (`Depth32Float`) is configured with `GreaterEqual` compare, `clearDepth = 0.0`, and bound to the temporal pipeline with `setDepthReversed(true)`.
+- **Commit**:
+  ```bash
+  git add src/SimdMath.hpp src/Renderer.cpp src/TemporalUpscaler.hpp
+  git commit -m "feat(depth): configure reversed-z depth buffer for temporal reconstruction"
+  ```

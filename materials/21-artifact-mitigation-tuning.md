@@ -1,77 +1,66 @@
-# TASK-21: Temporal Artifact Mitigation & Tuning
+# TASK-21: Temporal Scaler Tuning & Artifact Mitigation
 
 ## 1. Concept & Mental Model
-While temporal upscaling achieves remarkable subpixel sharpness, imperfect velocity buffers and disocclusions can introduce temporal artifacts such as ghosting trails, edge shimmering, and thin line flickering. Mitigation techniques stabilize the reconstruction pipeline through neighborhood color clamping (AABB clipping in YCoCg space), velocity dilation along silhouette edges, and motion vector scaling.
 
-## 2. Mathematical Foundations & Algorithms
-### Neighborhood Color Clamping (AABB Clipping in YCoCg Space)
-To eliminate ghosting when an object moves and reveals previously hidden background (disocclusion), the reprojected historical sample $\mathbf{C}_{\text{hist}}$ must be clamped within the color bounding box of the current frame's $3 \times 3$ neighborhood.
+### Real-World MetalFX Tuning
+MetalFX Temporal is a closed-source, highly optimized neural/heuristic reconstruction pipeline running directly on Apple Silicon GPU and Apple Neural Engine (ANE) hardware. 
 
-Transform RGB into decorrelated YCoCg space:
-$$\begin{bmatrix} Y \\ C_o \\ C_g \end{bmatrix} = \begin{bmatrix} 0.25 & 0.50 & 0.25 \\ 0.50 & 0.00 & -0.50 \\ -0.25 & 0.50 & -0.25 \end{bmatrix} \begin{bmatrix} R \\ G \\ B \end{bmatrix}$$
+You do not write internal AABB color clipping or YCoCg bounding box clamping kernels yourself—MetalFX performs these internally. Instead, tuning MetalFX involves configuring **hardware scaling factors, active content viewports, camera cut telemetry, and reactive masks**.
 
-Compute neighborhood mean $\mu$ and standard deviation $\sigma$:
-$$\mu = \frac{1}{9} \sum_{i \in 3 \times 3} \mathbf{c}_i, \quad \sigma = \sqrt{\frac{1}{9} \sum_{i \in 3 \times 3} (\mathbf{c}_i - \mu)^2}$$
-$$\mathbf{c}_{\text{min}} = \mu - \gamma \sigma, \quad \mathbf{c}_{\text{max}} = \mu + \gamma \sigma \quad (\text{typically } \gamma \in [1.0, 1.5])$$
-$$\mathbf{C}_{\text{clamped}} = \text{clamp}(\mathbf{C}_{\text{hist}}, \mathbf{c}_{\text{min}}, \mathbf{c}_{\text{max}})$$
+---
 
-### Velocity Dilation (Nearest Depth Search)
-Thin geometry (such as ropes, antennas, and wireframes) suffers from velocity bleeding when motion vectors are bilinearly sampled across background edges. Velocity dilation searches the $3 \times 3$ neighborhood and adopts the velocity of the closest depth sample (in Reversed-Z, maximum depth):
-$$\mathbf{v}_{\text{dilated}}(\mathbf{p}) = \mathbf{v}\left( \arg\max_{\mathbf{q} \in \mathcal{N}_{3 \times 3}(\mathbf{p})} Z(\mathbf{q}) \right)$$
+## 2. Essential MetalFX Tuning Parameters
 
-## 3. Metal & C++ Blueprint
-
-### 1. Velocity Dilation Pre-Pass Kernel (MSL Compute)
-```metal
-#include <metal_stdlib>
-using namespace metal;
-
-kernel void dilateMotionAndDepth(
-    texture2d<float, access::read> inDepth    [[texture(0)]],
-    texture2d<float, access::read> inMotion   [[texture(1)]],
-    texture2d<float, access::write> outMotion [[texture(2)]],
-    uint2 gid [[thread_position_in_grid]]
-) {
-    if (gid.x >= inDepth.get_width() || gid.y >= inDepth.get_height()) return;
-
-    float maxDepth = -1.0f; // In Reversed-Z, closest depth is maximum
-    float2 bestMotion = float2(0.0f);
-
-    // 3x3 neighborhood search for closest surface
-    for (int dy = -1; dy <= 1; ++dy) {
-        for (int dx = -1; dx <= 1; ++dx) {
-            uint2 coord = uint2(clamp(int2(gid) + int2(dx, dy), int2(0), int2(inDepth.get_width() - 1, inDepth.get_height() - 1)));
-            float d = inDepth.read(coord).r;
-            if (d > maxDepth) {
-                maxDepth = d;
-                bestMotion = inMotion.read(coord).rg;
-            }
-        }
-    }
-
-    outMotion.write(float4(bestMotion, 0.0, 1.0), gid);
-}
-```
-
-### 2. Motion Vector Scaling & Tuning Parameters
+### 1. Motion Vector Scaling (`setMotionVectorScaleX / Y`)
+If your shader outputs motion vectors in normalized NDC coordinates $[-1, 1]$ rather than pixel units:
 ```cpp
-// If motion vectors are in normalized NDC [-1, 1] rather than pixel space,
-// configure the scale factors on the compiled scaler instance:
+// Inform MetalFX to scale normalized NDC velocities to input pixel units
 pTemporalScaler->setMotionVectorScaleX(static_cast<float>(inputWidth));
 pTemporalScaler->setMotionVectorScaleY(static_cast<float>(inputHeight));
 ```
+If your shader already outputs pixel units (as done in TASK-18B), the default scale of `1.0` should be preserved.
+
+### 2. Dynamic Content Resolution (`setInputContentWidth / Height`)
+Dynamic Resolution Scaling (DRS) dynamically alters internal render resolution based on GPU workload without reallocating physical textures.
+You allocate maximum bounds (e.g. $1920 \times 1080$), render into an active subregion (e.g. $1280 \times 720$), and instruct MetalFX:
+```cpp
+pTemporalScaler->setInputContentWidth(activeWidth);
+pTemporalScaler->setInputContentHeight(activeHeight);
+```
+
+### 3. Reactive Masks (Preventing Ghosting on Particles & Alpha)
+Translucent particles, fire, smoke, and glass do not write reliable motion vectors because they move independently of the geometry behind them. 
+A **Reactive Mask** (`MTL::PixelFormatR8Unorm`) marks pixels where temporal history accumulation should be reduced or ignored:
+- `0.0`: Full temporal accumulation (standard opaque geometry).
+- `1.0`: Zero temporal accumulation (instant refresh, prevents alpha ghosting trails).
+
+---
+
+## 3. Diagnostic Matrix: Common Temporal Defects
+
+| Visual Defect | Likely Root Cause | Verification & Fix |
+|---|---|---|
+| **Smearing / Ghosting behind moving objects** | Inverted motion vector sign ($\mathbf{p}_{\text{curr}} - \mathbf{p}_{\text{prev}}$) | Verify vector formula points **from current back to previous**: $\mathbf{p}_{\text{prev}} - \mathbf{p}_{\text{curr}}$. |
+| **Violent screen-wide jitter** | Camera jitter applied to motion vector calculation | Ensure `previousMVP` and `currentMVP` used for velocities are strictly **unjittered**. |
+| **Ghosting on camera cuts / teleports** | History not invalidated | Trigger `pTemporalScaler->setReset(true)` for the frame following a cut. |
+| **Fine texture shimmering on resting objects** | Incorrect jitter scaling factor | Verify jitter is in $[-0.5, 0.5]$ range and matches input pixel dimensions. |
+| **Black screen or static visual soup** | Missing `StoreActionStore` on depth or motion | Verify both depth and motion render pass attachments specify `MTL::StoreActionStore`. |
+
+---
 
 ## 4. Step-by-Step Implementation Checklist
-- [ ] Inspect motion vector textures visually in Xcode GPU capture to verify edge alignment.
-- [ ] Insert a lightweight velocity dilation compute dispatch before the temporal scaler pass.
-- [ ] Test scene with fast-moving thin geometry (e.g. rotating wireframe cube).
-- [ ] Confirm that thin lines remain continuous during movement without breaking or ghosting.
-- [ ] Tune $\gamma$ bounding box clamping parameter to balance ghosting suppression against edge stability.
+- [ ] Verify motion vector scaling factors match your shader output conventions.
+- [ ] Test fast camera motion and verify that geometry edges remain sharp without long trailing artifacts.
+- [ ] Add a rotating high-speed object to test disocclusion handling.
+- [ ] Verify that triggering camera cuts (`setReset(true)`) instantly clears previous history without ghosting.
+- [ ] Fine-tune camera motion thresholds to balance temporal stability against responsive updates.
 
-## 5. Common Pitfalls & Debugging Checklist
-- **Ghosting Behind Fast Objects**:
-  - *Cause*: Motion vector magnitudes are too small or inverted.
-  - *Fix*: Multiply motion vectors by correct viewport dimension scale factors.
-- **Flickering Thin Lines During Motion**:
-  - *Cause*: Background velocity bleeding onto foreground geometry edges.
-  - *Fix*: Apply velocity dilation using Reversed-Z maximum depth test.
+---
+
+## 5. Definition of Done & Commit Message
+- **DoD**: MetalFX Temporal upscaling is tuned for motion stability, with verified motion vector scales and camera cut invalidation preventing ghosting artifacts.
+- **Commit**:
+  ```bash
+  git add src/TemporalUpscaler.hpp src/Renderer.cpp
+  git commit -m "feat(metalfx): tune motion vector scales and temporal stability parameters"
+  ```
