@@ -67,13 +67,19 @@ private:
 ```cpp
 #include <Metal/Metal.hpp>
 #include <Foundation/Foundation.hpp>
+#include <filesystem>
 
 class MetalCaptureSession {
 public:
     static bool captureFrame(MTL::CommandQueue* pQueue, const char* pOutputFilePath) {
+        // startCapture fails if the output directory already exists
+        std::error_code ec;
+        std::filesystem::remove_all(pOutputFilePath, ec);
+
         MTL::CaptureManager* pMgr = MTL::CaptureManager::sharedCaptureManager();
         if (!pMgr->supportsDestination(MTL::CaptureDestinationGPUTraceDocument)) {
-            std::cerr << "GPU Trace capture unsupported or METAL_CAPTURE_ENABLED not set.\n";
+            std::cerr << "GPU Trace capture unsupported or METAL_CAPTURE_ENABLED not set.\n"
+                      << "Tip: Run 'export METAL_CAPTURE_ENABLED=1' in your shell.\n";
             return false;
         }
 

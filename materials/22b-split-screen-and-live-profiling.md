@@ -34,6 +34,18 @@ MTL::ScissorRect rightScissor = { dividerX, 0, windowWidth - dividerX, windowHei
 enc->setScissorRect(rightScissor);
 ```
 
+### Shader Divider Line Uniform Struct (16-Byte Aligned)
+If drawing a vertical separator line or custom split shader, beware of struct alignment:
+```cpp
+struct alignas(16) SplitUniforms {
+    float splitPosition; // e.g. 0.5f in screen normalized space
+    float dividerWidth;  // e.g. 0.002f
+    float _pad[2];       // CRITICAL: 8 bytes padding to satisfy 16-byte MSL alignment!
+};
+
+static_assert(sizeof(SplitUniforms) == 16, "SplitUniforms must be exactly 16 bytes!");
+```
+
 ---
 
 ## 3. Performance Metrics: Measuring Upscaling Speedup

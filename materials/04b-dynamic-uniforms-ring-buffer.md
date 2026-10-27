@@ -81,6 +81,7 @@ struct FrameUniforms {
     float4x4 modelMatrix;
     float4   colorTint;
     float    time;
+    float    _pad[3]; // Align to 16 bytes (matches C++ struct size of 96B)
 };
 
 vertex VertexOut vertexMain(

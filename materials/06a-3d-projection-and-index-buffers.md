@@ -59,10 +59,17 @@ inline simd::float4x4 makePerspective(float fovRadians, float aspect, float near
 }
 
 // 8 Corner Vertices for a Unit Cube
-struct Vertex3D {
-    simd::float3 position;
-    simd::float3 color;
+// CRITICAL C++ LAYOUT NOTE:
+// On AppleClang ARM64, `simd::float3` has 16-byte alignment and occupies 16 bytes!
+// Therefore, `offsetof(Vertex3D, color) == 16`, NOT 12.
+// Total sizeof(Vertex3D) == 32 bytes (16 bytes position + 16 bytes color).
+struct alignas(16) Vertex3D {
+    simd::float3 position; // 16 bytes (12 bytes data + 4 bytes padding)
+    simd::float3 color;    // 16 bytes (12 bytes data + 4 bytes padding)
 };
+
+static_assert(sizeof(Vertex3D) == 32, "Vertex3D stride must be exactly 32 bytes!");
+static_assert(offsetof(Vertex3D, color) == 16, "Color attribute offset must be 16 bytes!");
 
 inline const Vertex3D kCubeVertices[8] = {
     { { -0.5f, -0.5f, -0.5f }, { 1.0f, 0.0f, 0.0f } },

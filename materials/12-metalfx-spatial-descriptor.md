@@ -23,6 +23,13 @@ A compiled scaler exposes the exact usage flags required for its input and outpu
 > If you bind `drawable->texture()` directly as the scaler's output texture, you **must set `metalLayer.framebufferOnly = NO;`** in your window setup! Otherwise, Metal validation will crash with:
 > `validateSpatialScaler: Output texture must support MTLTextureUsageShaderWrite`.
 
+> [!IMPORTANT]
+> **sRGB Format Consistency Rule**:
+> In MetalFX, input color format and output format must share the exact same sRGB transfer characteristics.
+> Pairing an sRGB input (`RGBA8Unorm_sRGB`) with a linear output (`RGBA8Unorm`) triggers a MetalFX runtime driver diagnostic:
+> `mixed sRGB inputs and outputs is not supported`. Always keep both as `_sRGB` or both as linear.
+> Also, when computing even dimensions for scalers, use unsigned bitwise masks: `W_in = std::max(16u, W_raw & ~1u);` to avoid `-Wconversion` compiler warnings.
+
 ---
 
 ## 3. Metal & C++ Blueprint

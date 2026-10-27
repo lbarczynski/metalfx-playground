@@ -92,6 +92,7 @@ attach->setStoreAction(MTL::StoreActionStore);
 
 MTL::RenderCommandEncoder* enc2 = cmd->renderCommandEncoder(presentPass);
 enc2->setRenderPipelineState(pBlitPipeline);
+enc2->setCullMode(MTL::CullModeNone); // CRITICAL: Prevent procedural triangle from being culled!
 enc2->setFragmentTexture(pLowResColorTexture, 0);
 enc2->setFragmentSamplerState(pLinearSampler, 0);
 
